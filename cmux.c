@@ -344,13 +344,16 @@ char *to_lower(const char *str) {
 }
 
 int main(int argc, char **argv) {
-	int serial_fd, major, speed, i;
+	int serial_fd, major, speed;
 	struct termios tio;
 	int ldisc = N_GSM0710;
 	struct gsm_config gsm;
 	char atcommand[40];
 
-	for (i = 1; i < argc; ++i) {
+	// TODO: implement checking if it is run by root
+	// here
+
+	for (int i = 1; i < argc; ++i) {
 		char **args = &argv[i];
 
 		if (match(args[0], "-h")) {
@@ -359,7 +362,9 @@ int main(int argc, char **argv) {
 		}
 
 		// this may and should be replaced with getopt()
-		if (handle_string_arg(args, &g_type, "--type")
+		if 
+		(
+			handle_string_arg(args, &g_type, "--type")
 			|| handle_string_arg(args, &g_device, "--device")
 			|| handle_number_arg(args, &g_speed, "--speed")
 			|| handle_number_arg(args, &g_mtu, "--mtu")
@@ -367,12 +372,12 @@ int main(int argc, char **argv) {
 			|| handle_number_arg(args, &g_daemon, "--daemon")
 			|| handle_number_arg(args, &g_nodes, "--nodes")
 			|| handle_string_arg(args, &g_driver, "--driver")
-			|| handle_string_arg(args, &g_base, "--base")) {
-				i++;
-		} else {
+			|| handle_string_arg(args, &g_base, "--base")
+		)
+			i++;
+		else 
 			errx(EXIT_FAILURE, "Unknown argument: %s", args[0]);
-		}
-	};
+	}
 
 	speed = to_line_speed(g_speed);
 	g_type = to_lower(g_type);
@@ -527,19 +532,29 @@ int main(int argc, char **argv) {
 	/* detach from the terminal if needed */
 	if (g_daemon) {
 		dbg("Going to background");
-		if (daemon(0,1) != 0)
+		int noclose = 1;
+		if (daemon(0, noclose) != 0)
 			err(EXIT_FAILURE, "Cannot daemonize");
 	}
+
+	// TODO: implement raising ppp data link
+	// here
+
+	// TODO: implement tcp/ip server here
+	// here
 
 	/* wait to keep the line discipline enabled, wake it up with a signal */
 	signal(SIGINT, signal_callback_handler);
 	signal(SIGTERM, signal_callback_handler);
+
 	pause();
 
+
+	// cleaning
+
 	/* remove the created virtual TTYs */
-	if (g_nodes > 0) {
+	if (g_nodes > 0) 
 		remove_nodes(g_base, g_nodes);
-	}
 
 	/* close the serial line */
 	close(serial_fd);
