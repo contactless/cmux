@@ -16,3 +16,4 @@
 *.out
 *.app
 cmux
+ldattach.c
