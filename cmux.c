@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <libgen.h>
 
 #include <fcntl.h>
 #include <termios.h>
@@ -29,11 +30,16 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 #include <linux/types.h>
 #include <unistd.h>
 #include <err.h>
 #include <signal.h>
 #include <ctype.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <netinet/in.h>
 
 /**
 *	gsmmux.h provides n_gsm line dicipline structures and functions.
@@ -72,6 +78,8 @@ char *g_driver = "gsmtty";
 */
 int g_daemon = 1;
 
+int g_server = 1;
+
 /**
 * whether or not to print debug messages to stderr
 *	0 : debug off
@@ -88,15 +96,21 @@ int g_speed = 115200;
 /* maximum transfert unit (MTU), value in bytes */
 int g_mtu = 512;
 
-/**
-*	Prints debug messages to stderr if debug is wanted
-*/
-static void dbg(char *fmt, ...) {
+extern char *program_invocation_short_name;
+
+// why do we need this if we have warnx?
+// this may be needed only as a warnx _wrapper_
+/* Prints debug messages to stderr if debug is wanted */
+static void dbg(const char *fmt, ...) {
 	va_list args;
 
 	if (g_debug) {
 		fflush(NULL);
 		va_start(args, fmt);
+		
+		// TODO: get pid and print it as well
+		fprintf(stderr, "%s: ", program_invocation_short_name); 
+
 		vfprintf(stderr, fmt, args);
 		va_end(args);
 		fprintf(stderr, "\n");
@@ -105,25 +119,75 @@ static void dbg(char *fmt, ...) {
 	return;
 }
 
+void strip_crlf(char *buf) {
+	for (unsigned int i = 0; i < strlen(buf); i++)
+		if (buf[i] < ' ') 
+			buf[i] = ' ';
+}
+
+// returns response in char* response
+int send_at_command(int tty_fd, const char *command, char *response)
+{
+	/* write the AT command to the serial line */
+	if (write(tty_fd, command, strlen(command)) <= 0)
+		warn("Cannot write to %s", g_device);
+
+	/* wait a bit to allow the modem to rest */
+	sleep(2); 
+
+	/* read the result of the command from the modem */
+	char resp[SIZE_BUF];
+	memset(resp, 0, sizeof(resp));
+	int r = read(tty_fd, resp, sizeof(resp));
+	if (r == -1)
+		warn("Cannot read %s", g_device);
+
+	/* if there is no result from the modem, return failure */
+	if (r == 0) {
+		dbg("%s\t: No response", command);
+		return -1;
+	}
+
+	/* if we have a result and want debug info, strip CR & LF out from the output */
+	if (g_debug) {
+		char debug[sizeof(resp)+40];
+		memset(debug, 0, sizeof(debug));
+		snprintf(debug, sizeof(debug), "%s => %s", command, resp);
+
+		strip_crlf(debug);
+		
+		dbg("%s", debug);
+	}
+
+	//strip_crlf(resp);
+	//snprintf(response, sizeof(resp), "%s", resp);
+	strcpy(response, resp);
+
+	/* if the output shows "OK" return success */
+	if (strstr(resp, "OK\r") != NULL)
+		return 0;
+
+	return -1;
+}
+
 /**
 *	Sends an AT command to the specified line and gets its result
 *	Returns  0 on success
 *			-1 on failure
 */
-int send_at_command(int serial_fd, char *command) {
-	char buf[SIZE_BUF];
-	int r;
-
+int send_at_command(int tty_fd, const char *command) 
+{
 	/* write the AT command to the serial line */
-	if (write(serial_fd, command, strlen(command)) <= 0)
+	if (write(tty_fd, command, strlen(command)) <= 0)
 		err(EXIT_FAILURE, "Cannot write to %s", g_device);
 
 	/* wait a bit to allow the modem to rest */
 	sleep(1);
 
 	/* read the result of the command from the modem */
-	memset(buf, 0, sizeof(buf));
-	r = read(serial_fd, buf, sizeof(buf));
+	char resp[SIZE_BUF];
+	memset(resp, 0, sizeof(resp));
+	int r = read(tty_fd, resp, sizeof(resp));
 	if (r == -1)
 		err(EXIT_FAILURE, "Cannot read %s", g_device);
 
@@ -135,22 +199,18 @@ int send_at_command(int serial_fd, char *command) {
 
 	/* if we have a result and want debug info, strip CR & LF out from the output */
 	if (g_debug) {
-		unsigned int i;
-		char bufp[sizeof(buf)+40];
-		memset(bufp, 0, sizeof(bufp));
-		snprintf(bufp, sizeof(bufp), "%s => %s", command, buf);
+		char debug[sizeof(resp)+40];
+		memset(debug, 0, sizeof(debug));
+		snprintf(debug, sizeof(debug), "%s => %s", command, resp);
 
-		for (i = 0; i < strlen(bufp); i++) {
-			if (bufp[i] < ' ')
-				bufp[i] = ' ';
-		}
-		dbg("%s", bufp);
+		strip_crlf(debug);
+
+		dbg("%s", debug);
 	}
 
 	/* if the output shows "OK" return success */
-	if (strstr(buf, "OK\r") != NULL) {
+	if (strstr(resp, "OK\r") != NULL) 
 		return 0;
-	}
 
 	return -1;
 }
@@ -259,10 +319,12 @@ void remove_nodes(char *basename, int nodes_count) {
 	return;
 }
 
+// strcmp wrapper
 int match(const char *arg, const char *opt) {
 	return (arg == opt) || (arg && (strcmp(arg, opt) == 0));
 }
 
+// strtol wrapper
 int parse_num(char *str, const char *opt) {
 	char* end = NULL;
 	int n = strtol(str, &end, 10);
@@ -328,20 +390,22 @@ int to_line_speed(int speed) {
 	}
 }
 
-// string lower case
-char *to_lower(const char *str) {
-	int i;
-
+// FIXME: cause memory leakage
+char *to_lower(char *str) {
 	if (str == NULL)
 		return NULL;
+	
+	// FIXME: from this we get memory leakage
+	// cause there is no further free() call
+	char *s = strdup(str); 
 
-	char *s = strdup(str);
-	for (i = 0; i < strlen(s); ++i) {
-		s[i] = tolower(s[i]);
-	}
+	for (int i = 0; i < strlen(s); ++i) 
+		s[i] = tolower(str[i]);
 
 	return s;
 }
+
+void wait_ifacenewaddr(const char* if_name);
 
 int main(int argc, char **argv) {
 	int serial_fd;
@@ -350,13 +414,11 @@ int main(int argc, char **argv) {
 	struct gsm_config gsm;
 	char atcommand[40];
 
-	// TODO: implement checking if it is run by root
-	// here
-
+	// parsing command line arguments
 	for (int i = 1; i < argc; ++i) {
 		char **args = &argv[i];
 
-		if (match(args[0], "-h")) {
+		if (match(args[0], "-h") || match(args[0], "--help")) {
 			print_help();
 			return 0;
 		}
@@ -375,14 +437,16 @@ int main(int argc, char **argv) {
 			|| handle_string_arg(args, &g_base, "--base")
 		)
 			i++;
-		else 
+		else {
+			print_help();
 			errx(EXIT_FAILURE, "Unknown argument: %s", args[0]);
+		}
 	}
 
 	int speed = to_line_speed(g_speed);
 	g_type = to_lower(g_type);
 
-	//--- validation ---//
+	//--- validating ---//
 	if (strcmp(g_type, "default") && strcmp(g_type, "sim900") && strcmp(g_type, "telit"))
 		errx(EXIT_FAILURE, "Invalid value for --type: %s", g_type);
 
@@ -393,11 +457,11 @@ int main(int argc, char **argv) {
 		errx(EXIT_FAILURE, "Invalid value for --debug: %d", g_debug);
 
 	if (g_nodes > 4)
-		errx(EXIT_FAILURE, "Invalid value for --nodes: %d , must be < 4.", g_nodes);
+		errx(EXIT_FAILURE, "Invalid value for --nodes: %d , must be < 5.", g_nodes);
+	//---			---//
 
 	if (match(g_type, "sim900"))
 		g_mtu = 255;
-	//---			---//
 
 	/* print global parameters */
 	dbg(
@@ -468,21 +532,23 @@ int main(int argc, char **argv) {
 
 		send_at_command(serial_fd, "AT+CMUX=0\r");
 	} else {
-		if (!match(g_type, "default"))
+		if (!match(g_type, "default")) // here "default" is treated as sierra hl6528
+			// this command is not supported with sierra hl6528
 			if (send_at_command(serial_fd, "AT+IFC=2,2\r") == -1)
-				errx(EXIT_FAILURE, "AT+IFC=2,2: bad response");
+				warnx("AT+IFC=2,2: bad response");
 
 		if (send_at_command(serial_fd, "AT+GMM\r") == -1)
 			warnx("AT+GMM: bad response");
 
 		if (send_at_command(serial_fd, "AT\r") == -1)
-			warnx("AT: bad response");
+			errx(EXIT_FAILURE, "AT: bad response");
 
 		if (!match(g_type, "sim900") && !match(g_type, "default")) {
+			// this command in this particular form is not supported with sierra hl6528
 			sprintf(atcommand, "AT+IPR=%d&w\r", g_speed);
 			if (send_at_command(serial_fd, atcommand) == -1)
-				errx(EXIT_FAILURE, "AT+IPR=%d&w: bad response", g_speed);
-		}
+				warnx("AT+IPR=%d&w: bad response", g_speed);
+		} 
 
 		sprintf(atcommand, "AT+CMUX=0,0,5,%d,10,3,30,10,2\r", g_mtu);
 		if (send_at_command(serial_fd, atcommand) == -1)
@@ -490,16 +556,16 @@ int main(int argc, char **argv) {
 	}
 
 	/* use n_gsm line discipline */
-	// be careful sleep() delay, cause modems have timeout
-	// passing which they reset, escape from cmux mode
-	if (match(g_type, "sim900")) {
+	// modems have timeout after which they reset, 
+	// escape from cmux mode. be careful
+	if (match(g_type, "sim900"))
 		sleep(0);
-	} else {
-		sleep(0);
-	}
+	else 
+		sleep(0); // if sierra hl6528
 
 	if (ioctl(serial_fd, TIOCSETD, &ldisc) < 0)
-		err(EXIT_FAILURE, "Cannot set N_GSM0710 line discipline. Is 'n_gsm' kernel module registered?");
+		err(EXIT_FAILURE, "Cannot set N_GSM0710 line discipline. \
+				Is 'n_gsm' kernel module registered?");
 
 	/* get n_gsm configuration */
 	if (ioctl(serial_fd, GSMIOC_GETCONF, &gsm) < 0)
@@ -517,50 +583,207 @@ int main(int argc, char **argv) {
 
 	if (ioctl(serial_fd, GSMIOC_SETCONF, &gsm) < 0)
 		err(EXIT_FAILURE, "Cannot set GSM multiplex parameters");
-	dbg("Line dicipline set.");
+	dbg("line dicipline set.");
 
 	/* create the virtual TTYs */
+	int ttys_created = 0;
 	if (g_nodes > 0) {
-		int created, major;
+		int major;
 		if ((major = get_major(g_driver)) < 0)
 			errx(EXIT_FAILURE, "Cannot get major number");
-		if ((created = make_nodes(major, g_base, g_nodes)) < g_nodes)
-			warnx("Cannot create all nodes, only %d of %d have been created.", created, g_nodes);
-		if (created == 0) {
+		if ((ttys_created = make_nodes(major, g_base, g_nodes)) < g_nodes)
+			warnx("Cannot create all nodes, only %d of %d have been created.", ttys_created, g_nodes);
+		if (ttys_created == 0)
 			warnx("No nodes have been created.");
-		}
 	}
 
+	/* take a break between creating ttys 
+	 * and starting pppd */
+	sleep(1);
+	
+	// TODO: refactor that big piece of code
+	/* start raising PPP data link */
+	pid_t server_pid;
+	pid_t pppd_pid = fork();
+	if (pppd_pid == 0) // child
+	{
+		// TODO: replace with other exec() function
+		if (execlp("pppd", "pppd", "/dev/ttyGSM2", "call", "provider", NULL) == -1)
+			err(EXIT_FAILURE, "execlp(pppd) failed"); 
+	}
+	else if (pppd_pid == -1)
+		warn("unable to start pppd: fork() failed"); // rare case
+	else if (pppd_pid > 0) 
+	{
+		dbg("pppd started");
+
+		int status;
+		if (waitpid(pppd_pid, &status, 0) == -1) 
+			warnx("waitpid(pppd_pid) failed");	
+		
+		int exited = WIFEXITED(status);
+		if (exited) 
+		{
+			int code = WEXITSTATUS(status);
+			if (code == 0) {
+				if (g_server) 
+				{
+					/* waiting for PPP to rise up */
+					dbg("waiting for ppp to be up...");
+
+					wait_ifacenewaddr("ppp"); // better get iface address here
+
+					dbg("ppp is up.");
+
+					/* start server */
+					server_pid = fork();
+					if (server_pid == 0) 
+					{
+						int sock = socket(AF_INET, SOCK_STREAM, 0);
+						if (sock == -1)
+							err(EXIT_FAILURE, "socket() failed");
+
+						struct sockaddr_in addr;
+						memset(&addr, 0, sizeof(struct sockaddr_in));
+						addr.sin_family = AF_INET;
+						addr.sin_port = htons(65535);
+						addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+						if (bind(sock, (struct sockaddr *) &addr, sizeof (addr)) == -1)
+							err(EXIT_FAILURE, "bind() failed");
+
+						if (listen(sock, 1) == -1)
+							err(EXIT_FAILURE, "listen() failed");
+
+						dbg("server: listening for incoming connections");
+
+						int msg_tty = open("/dev/ttyGSM1", O_RDWR | O_NOCTTY | O_NDELAY);
+						
+						while (1) // NOTE: not condition 
+						{
+							// so far this time we don't care about client address
+							int cfd = accept(sock, NULL, NULL);
+							if (cfd == -1)
+								continue;
+							
+							while (1) // NOTE: not good condition
+							{
+								char command[SIZE_BUF];
+								if (read(cfd, command, SIZE_BUF) <= 0)
+									break;
+								
+								// process query big piece of code
+								// TODO: requests to implement:
+								//		- get account balance
+								//		- get signal strength level!
+
+								// FIXME: this code is insecure
+								
+								char response[SIZE_BUF];
+								
+								if (send_at_command(msg_tty, command, response) == -1)
+									warnx("send_at_command() returned -1");
+
+								// send response
+								if (write(cfd, response, strlen(response)+1) <= 0)
+									break;
+							}
+						}
+						
+					} else if (server_pid == -1)
+						warn("unable to start server: fork() failed");
+					else if (server_pid > 0)
+						dbg("server started pid %d", server_pid);
+				} 
+			} 
+			else
+				warn("execlp pppd WEXITSTATUS %d, status %d", code, status); 
+		} 
+		else 
+			warn("execlp pppd WIFEXITED %d, status %d", exited, status); 
+	}
+	
 	/* detach from the terminal if needed */
 	if (g_daemon) {
 		dbg("Going to background");
 		int noclose = 1;
 		if (daemon(0, noclose) < 0)
-			err(EXIT_FAILURE, "cannot daemonize");
+			warn("cannot daemonize");
 	}
-
-	// TODO: implement raising ppp data link
-	// here
-
-
-	// TODO: implement tcp/ip server here
-	// here
 
 	/* wait to keep the line discipline enabled, wake it up with a signal */
 	signal(SIGINT, signal_callback_handler);
 	signal(SIGTERM, signal_callback_handler);
 
 	pause();
-
-
-	// cleaning
+			
+	if (g_server) {
+		if (kill(server_pid, SIGTERM) == -1) 
+			warn("unable to kill server"); 
+		else 
+			dbg("server terminated");
+	}
+	
+	// TODO: 
+	//	kill() pppd, take pid from /var/run/ppp0.pid
+	if (system("poff") == -1)
+		warn("unable to system(\"poff\")");
 
 	/* remove the created virtual TTYs */
 	if (g_nodes > 0) 
 		remove_nodes(g_base, g_nodes);
-
+	
 	/* close the serial line */
 	close(serial_fd);
 
 	return EXIT_SUCCESS;
+}
+
+// TODO: return ip address, test, debug
+void wait_ifacenewaddr(const char* if_name)
+{
+	int sock;
+	if ((sock = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE)) == -1) 
+		err(EXIT_FAILURE, "couldn't open NETLINK_ROUTE socket");
+
+	struct sockaddr_nl addr; 
+	memset(&addr, 0, sizeof(addr));
+	addr.nl_family = AF_NETLINK;
+	addr.nl_groups = RTMGRP_IPV4_IFADDR;
+
+	if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == -1)
+		err(EXIT_FAILURE, "couldn't bind");
+
+	int len;
+	const int BUFFSIZE = 4096;
+	char buffer[BUFFSIZE];
+	struct nlmsghdr *nlmh;
+	nlmh = (struct nlmsghdr *)buffer;
+	while ((len = recv(sock, nlmh, BUFFSIZE, 0)) > 0) 
+	{
+		while ((NLMSG_OK(nlmh, len)) && (nlmh->nlmsg_type != NLMSG_DONE)) 
+		{
+			if (nlmh->nlmsg_type == RTM_NEWADDR) 
+			{
+				struct ifaddrmsg *ifa = (struct ifaddrmsg *) NLMSG_DATA(nlmh);
+				struct rtattr *rth = IFA_RTA(ifa);
+				int rtl = IFA_PAYLOAD(nlmh);
+
+				while (rtl && RTA_OK(rth, rtl)) 
+				{
+					if (rth->rta_type == IFA_LOCAL) 
+					{
+						char name[IFNAMSIZ];
+						if_indextoname(ifa->ifa_index, name);
+						if (strstr(name, "ppp") != NULL) {
+							close(sock);
+							return;
+						}
+					}
+					rth = RTA_NEXT(rth, rtl);
+				}
+			} 
+			nlmh = NLMSG_NEXT(nlmh, len);
+		}
+	}
 }

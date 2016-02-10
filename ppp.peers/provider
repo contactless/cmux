@@ -14,7 +14,7 @@
 # modem initialization string.
 connect "/usr/sbin/chat -v -f /etc/chatscripts/gprs -T internet.tele2.ru" 
 
-debug dump updetach local nocrtscts noccp novj nodeflate receive-all
+debug dump updetach local noccp novj nodeflate receive-all
 
 # Serial device to which the modem is connected.
 #/dev/modem
@@ -31,7 +31,7 @@ usepeerdns
 defaultroute replacedefaultroute
 
 # Makes pppd "dial again" when the connection is lost.
-#persist
+persist # it is a good option!
 
 # Do not ask the remote to authenticate.
 noauth
