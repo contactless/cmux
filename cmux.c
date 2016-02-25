@@ -78,7 +78,7 @@ char *g_driver = "gsmtty";
 */
 int g_daemon = 1;
 
-int g_server = 1;
+int g_server = 0;
 
 /**
 * whether or not to print debug messages to stderr
@@ -126,7 +126,7 @@ void strip_crlf(char *buf) {
 }
 
 // returns response in char* response
-int send_at_command(int tty_fd, const char *command, char *response)
+int send_at_command_ex(int tty_fd, const char *command, char *response)
 {
 	/* write the AT command to the serial line */
 	if (write(tty_fd, command, strlen(command)) <= 0)
@@ -604,104 +604,106 @@ int main(int argc, char **argv) {
 	// TODO: refactor that big piece of code
 	/* start raising PPP data link */
 	pid_t server_pid;
-	pid_t pppd_pid = fork();
-	if (pppd_pid == 0) // child
+	int pppd = 0;
+	if (pppd)
 	{
-		// TODO: replace with other exec() function
-		if (execlp("pppd", "pppd", "/dev/ttyGSM2", "call", "provider", NULL) == -1)
-			err(EXIT_FAILURE, "execlp(pppd) failed"); 
-	}
-	else if (pppd_pid == -1)
-		warn("unable to start pppd: fork() failed"); // rare case
-	else if (pppd_pid > 0) 
-	{
-		dbg("pppd started");
-
-		int status;
-		if (waitpid(pppd_pid, &status, 0) == -1) 
-			warnx("waitpid(pppd_pid) failed");	
-		
-		int exited = WIFEXITED(status);
-		if (exited) 
+		pid_t pppd_pid = fork();
+		if (pppd_pid == 0) // child
 		{
-			int code = WEXITSTATUS(status);
-			if (code == 0) {
-				if (g_server) 
-				{
-					/* waiting for PPP to rise up */
-					dbg("waiting for ppp to be up...");
+			// TODO: replace with other exec() function
+			if (execlp("pppd", "pppd", "/dev/ttyGSM2", "call", "provider", NULL) == -1)
+				err(EXIT_FAILURE, "execlp(pppd) failed"); 
+		}
+		else if (pppd_pid == -1)
+			warn("unable to start pppd: fork() failed"); // rare case
+		else if (pppd_pid > 0) 
+		{
+			dbg("pppd started");
 
-					wait_ifacenewaddr("ppp"); // better get iface address here
-
-					dbg("ppp is up.");
-
-					/* start server */
-					server_pid = fork();
-					if (server_pid == 0) 
+			int status;
+			if (waitpid(pppd_pid, &status, 0) == -1) 
+				warnx("waitpid(pppd_pid) failed");	
+			
+			int exited = WIFEXITED(status);
+			if (exited) 
+			{
+				int code = WEXITSTATUS(status);
+				if (code == 0) {
+					if (g_server) 
 					{
-						int sock = socket(AF_INET, SOCK_STREAM, 0);
-						if (sock == -1)
-							err(EXIT_FAILURE, "socket() failed");
+						/* waiting for PPP to rise up */
+						dbg("waiting for ppp to be up...");
 
-						struct sockaddr_in addr;
-						memset(&addr, 0, sizeof(struct sockaddr_in));
-						addr.sin_family = AF_INET;
-						addr.sin_port = htons(65535);
-						addr.sin_addr.s_addr = htonl(INADDR_ANY);
+						wait_ifacenewaddr("ppp"); // better get iface address here
 
-						if (bind(sock, (struct sockaddr *) &addr, sizeof (addr)) == -1)
-							err(EXIT_FAILURE, "bind() failed");
+						dbg("ppp is up.");
 
-						if (listen(sock, 1) == -1)
-							err(EXIT_FAILURE, "listen() failed");
-
-						dbg("server: listening for incoming connections");
-
-						int msg_tty = open("/dev/ttyGSM1", O_RDWR | O_NOCTTY | O_NDELAY);
-						
-						while (1) // NOTE: not condition 
+						/* start server */
+						server_pid = fork();
+						if (server_pid == 0) 
 						{
-							// so far this time we don't care about client address
-							int cfd = accept(sock, NULL, NULL);
-							if (cfd == -1)
-								continue;
+							int sock = socket(AF_INET, SOCK_STREAM, 0);
+							if (sock == -1)
+								err(EXIT_FAILURE, "socket() failed");
+
+							struct sockaddr_in addr;
+							memset(&addr, 0, sizeof(struct sockaddr_in));
+							addr.sin_family = AF_INET;
+							addr.sin_port = htons(65535);
+							addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+							if (bind(sock, (struct sockaddr *) &addr, sizeof (addr)) == -1)
+								err(EXIT_FAILURE, "bind() failed");
+
+							if (listen(sock, 1) == -1)
+								err(EXIT_FAILURE, "listen() failed");
+
+							dbg("server: listening for incoming connections");
+
+							int msg_tty = open("/dev/ttyGSM1", O_RDWR | O_NOCTTY | O_NDELAY);
 							
-							while (1) // NOTE: not good condition
+							while (1) // NOTE: not good condition 
 							{
-								char command[SIZE_BUF];
-								if (read(cfd, command, SIZE_BUF) <= 0)
-									break;
+								// so far this time we don't care about client address
+								int cfd = accept(sock, NULL, NULL);
+								if (cfd == -1)
+									continue;
 								
-								// process query big piece of code
-								// TODO: requests to implement:
-								//		- get account balance
-								//		- get signal strength level!
+								while (1) // NOTE: not good condition
+								{
+									char command[SIZE_BUF];
+									if (read(cfd, command, SIZE_BUF) <= 0)
+										break;
+									
+									// process query big piece of code
+									// TODO: requests to implement:
+									//		- get account balance
+									//		- get signal strength level!
 
-								// FIXME: this code is insecure
-								
-								char response[SIZE_BUF];
-								
-								if (send_at_command(msg_tty, command, response) == -1)
-									warnx("send_at_command() returned -1");
+									// FIXME: this code is insecure, no server auth
+									
+									char response[SIZE_BUF];
+									
+									if (send_at_command_ex(msg_tty, command, response) == -1)
+										warnx("send_at_command() returned -1");
 
-								// send response
-								if (write(cfd, response, strlen(response)+1) <= 0)
-									break;
+									// send response
+									if (write(cfd, response, strlen(response)+1) <= 0)
+										break;
+								}
 							}
-						}
-						
-					} else if (server_pid == -1)
-						warn("unable to start server: fork() failed");
-					else if (server_pid > 0)
-						dbg("server started pid %d", server_pid);
-				} 
-			} 
-			else
-				warn("execlp pppd WEXITSTATUS %d, status %d", code, status); 
-		} 
-		else 
-			warn("execlp pppd WIFEXITED %d, status %d", exited, status); 
-	}
+						} else if (server_pid == -1)
+							warn("unable to start server: fork() failed");
+						else if (server_pid > 0)
+							dbg("server started pid %d", server_pid);
+					} 
+				} else
+					warn("execlp pppd WEXITSTATUS %d, status %d", code, status); 
+			} else 
+				warn("execlp pppd WIFEXITED %d, status %d", exited, status); 
+		}
+	} else 
+		warnx("pppd start not requested");
 	
 	/* detach from the terminal if needed */
 	if (g_daemon) {
@@ -726,7 +728,7 @@ int main(int argc, char **argv) {
 	
 	// TODO: 
 	//	kill() pppd, take pid from /var/run/ppp0.pid
-	if (system("poff") == -1)
+	if (pppd && system("poff") == -1)
 		warn("unable to system(\"poff\")");
 
 	/* remove the created virtual TTYs */
