@@ -1,9 +1,11 @@
 
 CC?=gcc
 CFLAGS?=-Wall -std=gnu99 -g
+
 DESTDIR?=/
 PREFIX?=usr
-TARGETS=cmux test 
+
+TARGETS=cmux test client
 
 all: cmux client test
 
