@@ -18,6 +18,9 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *
 */
+
+#define _GNU_SOURCE
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -35,6 +38,7 @@
 #include <linux/types.h>
 #include <unistd.h>
 #include <err.h>
+#include <errno.h>
 #include <signal.h>
 #include <ctype.h>
 #include <linux/netlink.h>
@@ -96,8 +100,6 @@ int g_speed = 115200;
 /* maximum transfert unit (MTU), value in bytes */
 int g_mtu = 512;
 
-extern char *program_invocation_short_name;
-
 // why do we need this if we have warnx?
 // this may be needed only as a warnx _wrapper_
 /* Prints debug messages to stderr if debug is wanted */
@@ -120,13 +122,13 @@ static void dbg(const char *fmt, ...) {
 }
 
 void strip_crlf(char *buf) {
-	for (unsigned int i = 0; i < strlen(buf); i++)
+	for (int i = 0; i < strlen(buf); i++)
 		if (buf[i] < ' ') 
 			buf[i] = ' ';
 }
 
 // returns response in char* response
-int send_at_command_ex(int tty_fd, const char *command, char *response)
+int send_at_command_ex(const int tty_fd, const char *command, char *response)
 {
 	/* write the AT command to the serial line */
 	if (write(tty_fd, command, strlen(command)) <= 0)
@@ -175,7 +177,7 @@ int send_at_command_ex(int tty_fd, const char *command, char *response)
 *	Returns  0 on success
 *			-1 on failure
 */
-int send_at_command(int tty_fd, const char *command) 
+int send_at_command(const int tty_fd, const char *command) 
 {
 	/* write the AT command to the serial line */
 	if (write(tty_fd, command, strlen(command)) <= 0)
@@ -227,7 +229,7 @@ void signal_callback_handler(int signum) {
 *	Returns  the major number on success
 *			-1 on failure
 */
-int get_major(char *driver) {
+int get_major(const char *driver) {
 	FILE *fp;
 	char *line = NULL;
 	size_t len = 0;
@@ -265,7 +267,7 @@ int get_major(char *driver) {
 *	Creates nodes for the virtual TTYs
 *	Returns the number of nodes created
 */
-int make_nodes(int major, char *basename, int nodes_count) {
+int make_nodes(const int major, const char *basename, const int nodes_count) {
 	int minor, created = 0;
 	dev_t device;
 	char node_name[15];
@@ -301,7 +303,7 @@ int make_nodes(int major, char *basename, int nodes_count) {
 *	Removes previously created TTY nodes
 *	Returns nothing, it doesn't really matter if it fails
 */
-void remove_nodes(char *basename, int nodes_count) {
+void remove_nodes(const char *basename, const int nodes_count) {
 	char node_name[15];
 	int node;
 
@@ -319,7 +321,7 @@ void remove_nodes(char *basename, int nodes_count) {
 	return;
 }
 
-// strcmp wrapper
+// strcmp advanded wrapper
 int match(const char *arg, const char *opt) {
 	return (arg == opt) || (arg && (strcmp(arg, opt) == 0));
 }
@@ -391,7 +393,7 @@ int to_line_speed(int speed) {
 }
 
 // FIXME: cause memory leakage
-char *to_lower(char *str) {
+char *to_lower(const char *str) {
 	if (str == NULL)
 		return NULL;
 	
@@ -406,6 +408,7 @@ char *to_lower(char *str) {
 }
 
 void wait_ifacenewaddr(const char* if_name);
+void server_process_function();
 
 int main(int argc, char **argv) {
 	int serial_fd;
@@ -640,59 +643,9 @@ int main(int argc, char **argv) {
 
 						/* start server */
 						server_pid = fork();
-						if (server_pid == 0) 
-						{
-							int sock = socket(AF_INET, SOCK_STREAM, 0);
-							if (sock == -1)
-								err(EXIT_FAILURE, "socket() failed");
-
-							struct sockaddr_in addr;
-							memset(&addr, 0, sizeof(struct sockaddr_in));
-							addr.sin_family = AF_INET;
-							addr.sin_port = htons(65535);
-							addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-							if (bind(sock, (struct sockaddr *) &addr, sizeof (addr)) == -1)
-								err(EXIT_FAILURE, "bind() failed");
-
-							if (listen(sock, 1) == -1)
-								err(EXIT_FAILURE, "listen() failed");
-
-							dbg("server: listening for incoming connections");
-
-							int msg_tty = open("/dev/ttyGSM1", O_RDWR | O_NOCTTY | O_NDELAY);
-							
-							while (1) // NOTE: not good condition 
-							{
-								// so far this time we don't care about client address
-								int cfd = accept(sock, NULL, NULL);
-								if (cfd == -1)
-									continue;
-								
-								while (1) // NOTE: not good condition
-								{
-									char command[SIZE_BUF];
-									if (read(cfd, command, SIZE_BUF) <= 0)
-										break;
-									
-									// TODO: requests to implement:
-									//		- get account balance
-									//		- get signal strength level!
-
-									// FIXME: this code is insecure 
-									// it implements tty over tcp without authentication 
-									
-									char response[SIZE_BUF];
-									
-									if (send_at_command_ex(msg_tty, command, response) == -1)
-										warnx("send_at_command() returned -1");
-
-									// send response
-									if (write(cfd, response, strlen(response)+1) <= 0)
-										break;
-								}
-							}
-						} else if (server_pid == -1)
+						if (server_pid == 0)
+							server_process_function();	
+						else if (server_pid == -1)
 							warn("unable to start server: fork() failed");
 						else if (server_pid > 0)
 							dbg("server started pid %d", server_pid);
@@ -740,6 +693,61 @@ int main(int argc, char **argv) {
 
 	return EXIT_SUCCESS;
 }
+
+void server_process_function() 
+{
+	int sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (sock == -1)
+		err(EXIT_FAILURE, "socket() failed");
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(struct sockaddr_in));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(65535);
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	if (bind(sock, (struct sockaddr *) &addr, sizeof (addr)) == -1)
+		err(EXIT_FAILURE, "bind() failed");
+
+	if (listen(sock, 1) == -1)
+		err(EXIT_FAILURE, "listen() failed");
+
+	dbg("server: listening for incoming connections");
+
+	int msg_tty = open("/dev/ttyGSM1", O_RDWR | O_NOCTTY | O_NDELAY);
+
+	while (1) // NOTE: not good condition 
+	{
+		// so far this time we don't care about client address
+		int cfd = accept(sock, NULL, NULL);
+		if (cfd == -1)
+			continue;
+
+		while (1) // NOTE: not good condition
+		{
+			char command[SIZE_BUF];
+			if (read(cfd, command, SIZE_BUF) <= 0)
+				break;
+
+			// TODO: requests to implement:
+			//		- get account balance
+			//		- get signal strength level
+
+			// FIXME: this code is insecure 
+			// it implements tty over tcp without authentication 
+
+			char response[SIZE_BUF];
+
+			if (send_at_command_ex(msg_tty, command, response) == -1)
+				warnx("send_at_command() returned -1");
+
+			// send response
+			if (write(cfd, response, strlen(response)+1) <= 0)
+				break;
+		}
+	}
+}
+
 
 // TODO: return ip address of the interface
 void wait_ifacenewaddr(const char* if_name)
